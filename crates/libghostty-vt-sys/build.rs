@@ -40,37 +40,24 @@ fn main() {
 
     // Build libghostty-vt via zig.
     let install_prefix = out_dir.join("ghostty-install");
-
-    let mut build = Command::new("zig");
-    build
-        .arg("build")
-        .arg("-Demit-lib-vt")
-        .arg("--prefix")
-        .arg(&install_prefix)
-        .current_dir(&ghostty_dir);
-
-    // Only pass -Dtarget when cross-compiling. For native builds, let zig
-    // auto-detect the host (matches how ghostty's own CMakeLists.txt works).
-    if target != host {
-        let zig_target = zig_target(&target);
-        build.arg(format!("-Dtarget={zig_target}"));
-    }
-
-    run(build, "zig build");
+    build_ghostty(&ghostty_dir, &install_prefix, &target, &host);
 
     let lib_dir = install_prefix.join("lib");
+    let bin_dir = install_prefix.join("bin");
     let include_dir = install_prefix.join("include");
 
-    let lib_name = if target.contains("darwin") {
-        "libghostty-vt.0.1.0.dylib"
-    } else {
-        "libghostty-vt.so.0.1.0"
-    };
+    let search_dirs = library_search_dirs(&target, &install_prefix);
+    let artifact_found = search_dirs.iter().any(|dir| {
+        library_artifact_candidates(&target)
+            .iter()
+            .any(|name| dir.join(name).exists())
+    });
 
     assert!(
-        lib_dir.join(lib_name).exists(),
-        "expected shared library at {}",
-        lib_dir.join(lib_name).display()
+        artifact_found,
+        "expected one of {:?} in {:?}",
+        library_artifact_candidates(&target),
+        search_dirs
     );
     assert!(
         include_dir.join("ghostty").join("vt.h").exists(),
@@ -79,8 +66,155 @@ fn main() {
     );
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    if target.contains("windows") {
+        println!("cargo:rustc-link-search=native={}", bin_dir.display());
+    }
     println!("cargo:rustc-link-lib=dylib=ghostty-vt");
     println!("cargo:include={}", include_dir.display());
+}
+
+fn build_ghostty(ghostty_dir: &Path, install_prefix: &Path, target: &str, host: &str) {
+    if cfg!(windows) && host.contains("windows") {
+        build_ghostty_from_uucode_cache(ghostty_dir, install_prefix, target, host);
+        return;
+    }
+
+    let mut build = Command::new("zig");
+    build
+        .arg("build")
+        .arg("-Demit-lib-vt")
+        .arg("--prefix")
+        .arg(install_prefix)
+        .current_dir(ghostty_dir);
+
+    // Only pass -Dtarget when cross-compiling. For native builds, let zig
+    // auto-detect the host (matches how Ghostty's own build does it).
+    if target != host {
+        let zig_target = zig_target(target);
+        build.arg(format!("-Dtarget={zig_target}"));
+    }
+
+    run(build, "zig build");
+}
+
+fn build_ghostty_from_uucode_cache(
+    ghostty_dir: &Path,
+    install_prefix: &Path,
+    target: &str,
+    host: &str,
+) {
+    let ghostty_build_file = ghostty_dir.join("build.zig");
+    let local_cache_dir = ghostty_dir.join(".zig-cache");
+    let global_cache_dir = zig_global_cache_dir();
+
+    // Windows Zig 0.15.2 computes the helper executable path for uucode
+    // relative to the child cwd but then spawns it relative to the parent
+    // process cwd. Running the Ghostty build from the cached uucode package
+    // directory sidesteps that path resolution bug while still executing the
+    // same Ghostty build script.
+    let mut fetch = Command::new("zig");
+    fetch
+        .arg("build")
+        .arg("--fetch=needed")
+        .arg("--build-file")
+        .arg(&ghostty_build_file)
+        .arg("--cache-dir")
+        .arg(&local_cache_dir)
+        .arg("--global-cache-dir")
+        .arg(&global_cache_dir)
+        .arg("-Demit-lib-vt")
+        .current_dir(ghostty_dir);
+    if target != host {
+        fetch.arg(format!("-Dtarget={}", zig_target(target)));
+    }
+    run(fetch, "zig build --fetch=needed");
+
+    let uucode_dir = global_cache_dir
+        .join("p")
+        .join(read_zig_dependency_hash(ghostty_dir, "uucode"));
+    assert!(
+        uucode_dir.join("build.zig").exists(),
+        "expected cached uucode package at {}",
+        uucode_dir.display()
+    );
+
+    let mut build = Command::new("zig");
+    build
+        .arg("build")
+        .arg("--build-file")
+        .arg(&ghostty_build_file)
+        .arg("--cache-dir")
+        .arg(&local_cache_dir)
+        .arg("--global-cache-dir")
+        .arg(&global_cache_dir)
+        .arg("-Demit-lib-vt")
+        .arg("--prefix")
+        .arg(install_prefix)
+        .current_dir(&uucode_dir);
+    if target != host {
+        build.arg(format!("-Dtarget={}", zig_target(target)));
+    }
+    run(build, "zig build");
+}
+
+fn zig_global_cache_dir() -> PathBuf {
+    PathBuf::from(
+        env::var_os("LOCALAPPDATA")
+            .unwrap_or_else(|| panic!("LOCALAPPDATA must be set for Windows Ghostty builds")),
+    )
+    .join("zig")
+}
+
+fn read_zig_dependency_hash(ghostty_dir: &Path, dependency_name: &str) -> String {
+    let zon = std::fs::read_to_string(ghostty_dir.join("build.zig.zon"))
+        .unwrap_or_else(|error| panic!("failed to read Ghostty build.zig.zon: {error}"));
+    let dependency_marker = format!(".{dependency_name} = .{{");
+    let dependency_start = zon.find(&dependency_marker).unwrap_or_else(|| {
+        panic!(
+            "failed to locate dependency {dependency_name} in {}",
+            ghostty_dir.join("build.zig.zon").display()
+        )
+    });
+    let dependency_body = &zon[dependency_start..];
+    let hash_marker = ".hash = \"";
+    let hash_start = dependency_body.find(hash_marker).unwrap_or_else(|| {
+        panic!("failed to locate .hash for dependency {dependency_name} in Ghostty build.zig.zon")
+    });
+    let hash_value = &dependency_body[hash_start + hash_marker.len()..];
+    let hash_end = hash_value.find('"').unwrap_or_else(|| {
+        panic!("failed to parse .hash for dependency {dependency_name} in Ghostty build.zig.zon")
+    });
+    hash_value[..hash_end].to_owned()
+}
+
+fn library_search_dirs(target: &str, install_prefix: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![install_prefix.join("lib")];
+    if target.contains("windows") {
+        // Zig commonly places the runtime DLL in `bin` and the import library
+        // in `lib`, so search both when validating the build output.
+        dirs.push(install_prefix.join("bin"));
+    }
+    dirs
+}
+
+fn library_artifact_candidates(target: &str) -> &'static [&'static str] {
+    if target.contains("darwin") {
+        &["libghostty-vt.0.1.0.dylib", "libghostty-vt.dylib"]
+    } else if target.contains("windows-gnu") {
+        &[
+            "libghostty-vt.dll.a",
+            "ghostty-vt.dll",
+            "ghostty-vt.lib",
+        ]
+    } else if target.contains("windows-msvc") {
+        &[
+            "ghostty-vt.lib",
+            "ghostty-vt.dll",
+            "libghostty-vt.dll.lib",
+        ]
+    } else {
+        &["libghostty-vt.so.0.1.0", "libghostty-vt.so"]
+    }
 }
 
 /// Clone ghostty at the pinned commit into OUT_DIR/ghostty-src.
@@ -141,6 +275,10 @@ fn zig_target(target: &str) -> String {
         "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
         "aarch64-apple-darwin" => "aarch64-macos-none",
         "x86_64-apple-darwin" => "x86_64-macos-none",
+        "x86_64-pc-windows-gnu" => "x86_64-windows-gnu",
+        "aarch64-pc-windows-gnullvm" => "aarch64-windows-gnu",
+        "x86_64-pc-windows-msvc" => "x86_64-windows-msvc",
+        "aarch64-pc-windows-msvc" => "aarch64-windows-msvc",
         other => panic!("unsupported Rust target for vendored build: {other}"),
     };
     value.to_owned()
