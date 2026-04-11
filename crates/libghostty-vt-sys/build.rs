@@ -4,7 +4,28 @@ use std::process::Command;
 
 /// Pinned ghostty commit. Update this to pull a newer version.
 const GHOSTTY_REPO: &str = "https://github.com/ghostty-org/ghostty.git";
-const GHOSTTY_COMMIT: &str = "bebca84668947bfc92b9a30ed58712e1c34eee1d";
+const GHOSTTY_COMMIT: &str = "a1e75daef8b64426dbca551c6e41b1fbc2b7ae24";
+const GHOSTTY_LIB_VT_XCFRAMEWORK_BLOCK: &str = r#"    // libghostty-vt xcframework (Apple only, universal binary).
+    // Only when building on macOS (not cross-compiling) since
+    // xcodebuild is required.
+    if (builtin.os.tag.isDarwin() and config.target.result.os.tag.isDarwin()) {
+        const apple_libs = try buildpkg.GhosttyLibVt.initStaticAppleUniversal(
+            b,
+            &config,
+            &deps,
+            &mod,
+        );
+        const xcframework = buildpkg.GhosttyLibVt.xcframework(&apple_libs, b);
+        b.getInstallStep().dependOn(xcframework.step);
+    }
+
+"#;
+const GHOSTTY_LIB_VT_XCFRAMEWORK_PATCH: &str = r#"    // libghostty-vt xcframework (Apple only, universal binary).
+    // Disabled for libghostty-rs vendored builds because the Rust crate only
+    // needs the installable library artifact and this older Ghostty revision
+    // always attempts iOS simulator/device slices on native macOS.
+
+"#;
 
 fn main() {
     // docs.rs has no Zig toolchain. The checked-in bindings in src/bindings.rs
@@ -228,6 +249,7 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
         && let Ok(existing) = std::fs::read_to_string(&stamp)
         && existing.trim() == GHOSTTY_COMMIT
     {
+        patch_ghostty_for_vendored_lib_vt_build(&src_dir);
         return src_dir;
     }
 
@@ -255,9 +277,32 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
         .current_dir(&src_dir);
     run(checkout, "git checkout ghostty commit");
 
+    patch_ghostty_for_vendored_lib_vt_build(&src_dir);
+
     std::fs::write(&stamp, GHOSTTY_COMMIT).unwrap_or_else(|e| panic!("failed to write stamp: {e}"));
 
     src_dir
+}
+
+fn patch_ghostty_for_vendored_lib_vt_build(src_dir: &Path) {
+    let build_zig_path = src_dir.join("build.zig");
+    let build_zig = std::fs::read_to_string(&build_zig_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", build_zig_path.display()));
+
+    if build_zig.contains(GHOSTTY_LIB_VT_XCFRAMEWORK_PATCH) {
+        return;
+    }
+
+    let patched = build_zig.replace(
+        GHOSTTY_LIB_VT_XCFRAMEWORK_BLOCK,
+        GHOSTTY_LIB_VT_XCFRAMEWORK_PATCH,
+    );
+    if patched == build_zig {
+        return;
+    }
+
+    std::fs::write(&build_zig_path, patched)
+        .unwrap_or_else(|error| panic!("failed to patch {}: {error}", build_zig_path.display()));
 }
 
 fn run(mut command: Command, context: &str) {
