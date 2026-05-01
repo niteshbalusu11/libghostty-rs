@@ -1,4 +1,7 @@
+use std::collections::BTreeSet;
 use std::env;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -119,8 +122,81 @@ fn build_vendored(link_mode: LinkMode) {
     let install_prefix = out_dir.join("ghostty-install");
     let zig_cache_dir = out_dir.join("zig-cache");
     let zig_global_cache_dir = out_dir.join("zig-global-cache");
-
     let optimize = zig_optimize_mode();
+
+    build_ghostty(
+        &ghostty_dir,
+        &install_prefix,
+        &zig_cache_dir,
+        &zig_global_cache_dir,
+        &target,
+        &host,
+        optimize,
+    );
+
+    let lib_dir = install_prefix.join("lib");
+    let include_dir = install_prefix.join("include");
+    warn_unused_xcframework(&lib_dir);
+
+    let requested_library = std::fs::read_dir(&lib_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", lib_dir.display()))
+        .find_map(|entry| {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("failed to read entry from {}: {error}", lib_dir.display())
+            });
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                return None;
+            };
+
+            link_mode
+                .matches_library(&target, file_name)
+                .then(|| entry.path())
+        });
+    assert!(
+        requested_library.is_some(),
+        "expected libghostty-vt {} in {}",
+        link_mode.artifact_kind(),
+        lib_dir.display()
+    );
+    assert!(
+        include_dir.join("ghostty").join("vt.h").exists(),
+        "expected header at {}",
+        include_dir.join("ghostty").join("vt.h").display()
+    );
+
+    if let (LinkMode::Static, Some(archive_path)) = (link_mode, requested_library.as_deref()) {
+        rename_private_static_archive_symbols(archive_path, out_dir.as_path(), &target);
+    }
+
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    match link_mode {
+        LinkMode::Dynamic => println!("cargo:rustc-link-lib=dylib=ghostty-vt"),
+        LinkMode::Static => println!("cargo:rustc-link-lib=static=ghostty-vt"),
+    }
+    emit_include_metadata(&[include_dir]);
+}
+
+fn build_ghostty(
+    ghostty_dir: &Path,
+    install_prefix: &Path,
+    zig_cache_dir: &Path,
+    zig_global_cache_dir: &Path,
+    target: &str,
+    host: &str,
+    optimize: &str,
+) {
+    if cfg!(windows) && host.contains("windows") {
+        build_ghostty_from_uucode_cache(
+            ghostty_dir,
+            install_prefix,
+            zig_cache_dir,
+            target,
+            host,
+            optimize,
+        );
+        return;
+    }
 
     let mut build = Command::new("zig");
     build
@@ -164,42 +240,202 @@ fn build_vendored(link_mode: LinkMode) {
     }
 
     run(build, "zig build");
+}
 
-    let lib_dir = install_prefix.join("lib");
-    let include_dir = install_prefix.join("include");
-    warn_unused_xcframework(&lib_dir);
+fn build_ghostty_from_uucode_cache(
+    ghostty_dir: &Path,
+    install_prefix: &Path,
+    zig_cache_dir: &Path,
+    target: &str,
+    host: &str,
+    optimize: &str,
+) {
+    let ghostty_build_file = ghostty_dir.join("build.zig");
+    let global_cache_dir = zig_windows_global_cache_dir();
 
-    let has_requested_library = std::fs::read_dir(&lib_dir)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", lib_dir.display()))
-        .any(|entry| {
-            let entry = entry.unwrap_or_else(|error| {
-                panic!("failed to read entry from {}: {error}", lib_dir.display())
-            });
-            let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
-                return false;
-            };
-
-            link_mode.matches_library(&target, file_name)
-        });
-    assert!(
-        has_requested_library,
-        "expected libghostty-vt {} in {}",
-        link_mode.artifact_kind(),
-        lib_dir.display()
-    );
-    assert!(
-        include_dir.join("ghostty").join("vt.h").exists(),
-        "expected header at {}",
-        include_dir.join("ghostty").join("vt.h").display()
-    );
-
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    match link_mode {
-        LinkMode::Dynamic => println!("cargo:rustc-link-lib=dylib=ghostty-vt"),
-        LinkMode::Static => println!("cargo:rustc-link-lib=static=ghostty-vt"),
+    // Windows Zig 0.15.x computes the helper executable path for uucode
+    // relative to the child cwd but then spawns it relative to the parent
+    // process cwd. Running the Ghostty build from the cached uucode package
+    // directory sidesteps that path resolution bug while still executing the
+    // same Ghostty build script.
+    let mut fetch = Command::new("zig");
+    fetch
+        .arg("build")
+        .arg("--fetch=needed")
+        .arg("--build-file")
+        .arg(&ghostty_build_file)
+        .arg("--cache-dir")
+        .arg(zig_cache_dir)
+        .arg("--global-cache-dir")
+        .arg(&global_cache_dir)
+        .arg("-Demit-lib-vt")
+        .arg(format!("-Doptimize={optimize}"))
+        .arg("-Demit-xcframework=false")
+        .arg("-Dapp-runtime=none")
+        .current_dir(ghostty_dir);
+    if target != host {
+        fetch.arg(format!("-Dtarget={}", zig_target(target)));
     }
-    emit_include_metadata(&[include_dir]);
+    run(fetch, "zig build --fetch=needed");
+
+    let uucode_dir = global_cache_dir
+        .join("p")
+        .join(read_zig_dependency_hash(ghostty_dir, "uucode"));
+    assert!(
+        uucode_dir.join("build.zig").exists(),
+        "expected cached uucode package at {}",
+        uucode_dir.display()
+    );
+
+    let mut build = Command::new("zig");
+    build
+        .arg("build")
+        .arg("--build-file")
+        .arg(&ghostty_build_file)
+        .arg("--cache-dir")
+        .arg(zig_cache_dir)
+        .arg("--global-cache-dir")
+        .arg(&global_cache_dir)
+        .arg("-Demit-lib-vt")
+        .arg(format!("-Doptimize={optimize}"))
+        .arg("-Demit-xcframework=false")
+        .arg("-Dapp-runtime=none")
+        .arg("--prefix")
+        .arg(install_prefix)
+        .current_dir(&uucode_dir);
+    if target != host {
+        build.arg(format!("-Dtarget={}", zig_target(target)));
+    }
+    run(build, "zig build");
+}
+
+fn zig_windows_global_cache_dir() -> PathBuf {
+    PathBuf::from(
+        env::var_os("LOCALAPPDATA")
+            .unwrap_or_else(|| panic!("LOCALAPPDATA must be set for Windows Ghostty builds")),
+    )
+    .join("zig")
+}
+
+fn read_zig_dependency_hash(ghostty_dir: &Path, dependency_name: &str) -> String {
+    let zon = std::fs::read_to_string(ghostty_dir.join("build.zig.zon"))
+        .unwrap_or_else(|error| panic!("failed to read Ghostty build.zig.zon: {error}"));
+    let dependency_marker = format!(".{dependency_name} = .{{");
+    let dependency_start = zon.find(&dependency_marker).unwrap_or_else(|| {
+        panic!(
+            "failed to locate dependency {dependency_name} in {}",
+            ghostty_dir.join("build.zig.zon").display()
+        )
+    });
+    let dependency_body = &zon[dependency_start..];
+    let hash_marker = ".hash = \"";
+    let hash_start = dependency_body.find(hash_marker).unwrap_or_else(|| {
+        panic!("failed to locate .hash for dependency {dependency_name} in Ghostty build.zig.zon")
+    });
+    let hash_value = &dependency_body[hash_start + hash_marker.len()..];
+    let hash_end = hash_value.find('"').unwrap_or_else(|| {
+        panic!("failed to parse .hash for dependency {dependency_name} in Ghostty build.zig.zon")
+    });
+    hash_value[..hash_end].to_owned()
+}
+
+fn rename_private_static_archive_symbols(archive_path: &Path, out_dir: &Path, target: &str) {
+    if target.contains("windows") {
+        return;
+    }
+
+    let Some(objcopy) = find_tool("OBJCOPY", &["objcopy", "llvm-objcopy"]) else {
+        println!(
+            "cargo:warning=unable to rename private libghostty-vt symbols in {}; objcopy not found",
+            archive_path.display()
+        );
+        return;
+    };
+
+    let scratch_dir = out_dir.join("static-archive-symbols");
+    if scratch_dir.exists() {
+        std::fs::remove_dir_all(&scratch_dir)
+            .unwrap_or_else(|error| panic!("failed to remove {}: {error}", scratch_dir.display()));
+    }
+    std::fs::create_dir_all(&scratch_dir)
+        .unwrap_or_else(|error| panic!("failed to create {}: {error}", scratch_dir.display()));
+
+    let mut list = Command::new("ar");
+    list.arg("t").arg(archive_path);
+    let members = run_output(list, "ar t libghostty-vt static archive");
+
+    let mut extract = Command::new("ar");
+    extract.arg("x").arg(archive_path).current_dir(&scratch_dir);
+    run(extract, "ar x libghostty-vt static archive");
+
+    let object_names: Vec<String> = members
+        .lines()
+        .map(str::trim)
+        .filter(|member| !member.is_empty() && *member != "__.SYMDEF")
+        .filter(|member| {
+            let lower = member.to_ascii_lowercase();
+            lower.ends_with(".o") || lower.ends_with(".obj")
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+
+    for object_name in &object_names {
+        let object_path = scratch_dir.join(object_name);
+        if let Ok(metadata) = object_path.metadata() {
+            let mut permissions = metadata.permissions();
+            #[cfg(unix)]
+            permissions.set_mode(0o600);
+            #[cfg(not(unix))]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&object_path, permissions).unwrap_or_else(|error| {
+                panic!("failed to make {} writable: {error}", object_path.display())
+            });
+        }
+    }
+
+    let mut symbols = BTreeSet::new();
+    for object_name in &object_names {
+        let object_path = scratch_dir.join(object_name);
+        let mut nm = Command::new("nm");
+        nm.arg("-g").arg(&object_path);
+        for line in run_output(nm, "nm libghostty-vt object").lines() {
+            let Some(symbol) = line.split_whitespace().last() else {
+                continue;
+            };
+            if symbol.contains("simdutf") && !symbol.contains("libghostty_rs_local") {
+                symbols.insert(symbol.to_owned());
+            }
+        }
+    }
+
+    if symbols.is_empty() {
+        return;
+    }
+
+    let rename_map_path = scratch_dir.join("private-symbols.map");
+    let rename_map = symbols
+        .iter()
+        .map(|symbol| format!("{symbol} libghostty_rs_local_{symbol}\n"))
+        .collect::<String>();
+    std::fs::write(&rename_map_path, rename_map)
+        .unwrap_or_else(|error| panic!("failed to write {}: {error}", rename_map_path.display()));
+
+    for object_name in &object_names {
+        let object_path = scratch_dir.join(object_name);
+        let mut objcopy_command = Command::new(&objcopy);
+        objcopy_command
+            .arg(format!("--redefine-syms={}", rename_map_path.display()))
+            .arg(&object_path);
+        run(objcopy_command, "objcopy libghostty-vt private symbols");
+    }
+
+    let mut archive = Command::new("ar");
+    archive.arg("crs").arg(archive_path);
+    for object_name in &object_names {
+        archive.arg(object_name);
+    }
+    archive.current_dir(&scratch_dir);
+    run(archive, "ar crs libghostty-vt static archive");
 }
 
 fn warn_unused_xcframework(lib_dir: &Path) {
@@ -356,6 +592,36 @@ fn run(mut command: Command, context: &str) {
     assert!(status.success(), "{context} failed with status {status}");
 }
 
+fn run_output(mut command: Command, context: &str) -> String {
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to execute {context}: {error}"));
+    assert!(
+        output.status.success(),
+        "{context} failed with status {}",
+        output.status
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("{context} returned non-UTF-8 output: {error}"))
+}
+
+fn find_tool(env_name: &str, candidates: &[&str]) -> Option<PathBuf> {
+    if let Some(path) = env::var_os(env_name).filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        for candidate in candidates {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn zig_target(target: &str) -> String {
     let value = match target {
         "x86_64-unknown-linux-gnu" => "x86_64-linux-gnu",
@@ -364,6 +630,10 @@ fn zig_target(target: &str) -> String {
         "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
         "aarch64-apple-darwin" => "aarch64-macos-none",
         "x86_64-apple-darwin" => "x86_64-macos-none",
+        "x86_64-pc-windows-gnu" => "x86_64-windows-gnu",
+        "aarch64-pc-windows-gnullvm" => "aarch64-windows-gnu",
+        "x86_64-pc-windows-msvc" => "x86_64-windows-msvc",
+        "aarch64-pc-windows-msvc" => "aarch64-windows-msvc",
         other => panic!("unsupported Rust target for vendored build: {other}"),
     };
     value.to_owned()
