@@ -50,6 +50,14 @@ impl LinkMode {
         }
     }
 
+    fn link_library_name(self, target: &str) -> &'static str {
+        match self {
+            Self::Dynamic => "ghostty-vt",
+            Self::Static if target.contains("windows") => "ghostty-vt-static",
+            Self::Static => "ghostty-vt",
+        }
+    }
+
     #[cfg(feature = "pkg-config")]
     fn pkg_config_name(self) -> &'static str {
         match self {
@@ -170,9 +178,10 @@ fn build_vendored(link_mode: LinkMode) {
     }
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    let link_library_name = link_mode.link_library_name(&target);
     match link_mode {
-        LinkMode::Dynamic => println!("cargo:rustc-link-lib=dylib=ghostty-vt"),
-        LinkMode::Static => println!("cargo:rustc-link-lib=static=ghostty-vt"),
+        LinkMode::Dynamic => println!("cargo:rustc-link-lib=dylib={link_library_name}"),
+        LinkMode::Static => println!("cargo:rustc-link-lib=static={link_library_name}"),
     }
     emit_include_metadata(&[include_dir]);
 }
