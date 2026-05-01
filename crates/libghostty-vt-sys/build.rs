@@ -125,6 +125,9 @@ fn build_vendored(link_mode: LinkMode) {
         }
         Err(_) => fetch_ghostty(&out_dir),
     };
+    if let LinkMode::Static = link_mode {
+        isolate_vendored_simdutf_namespace(&ghostty_dir);
+    }
 
     // Build libghostty-vt via zig.
     let install_prefix = out_dir.join("ghostty-install");
@@ -346,6 +349,36 @@ fn read_zig_dependency_hash(ghostty_dir: &Path, dependency_name: &str) -> String
         panic!("failed to parse .hash for dependency {dependency_name} in Ghostty build.zig.zon")
     });
     hash_value[..hash_end].to_owned()
+}
+
+fn isolate_vendored_simdutf_namespace(ghostty_dir: &Path) {
+    const LOCAL_NAMESPACE: &str = "libghostty_rs_local_simdutf";
+
+    let files = [
+        "pkg/simdutf/vendor/simdutf.h",
+        "pkg/simdutf/vendor/simdutf.cpp",
+        "src/simd/base64.cpp",
+        "src/simd/vt.cpp",
+    ];
+
+    for relative_path in files {
+        let path = ghostty_dir.join(relative_path);
+        let mut contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let original = contents.clone();
+        contents = contents
+            .replace("namespace simdutf", &format!("namespace {LOCAL_NAMESPACE}"))
+            .replace("simdutf::", &format!("{LOCAL_NAMESPACE}::"))
+            .replace(
+                "using namespace simdutf;",
+                &format!("using namespace {LOCAL_NAMESPACE};"),
+            );
+
+        if contents != original {
+            std::fs::write(&path, contents)
+                .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+        }
+    }
 }
 
 fn rename_private_static_archive_symbols(archive_path: &Path, out_dir: &Path, target: &str) {
