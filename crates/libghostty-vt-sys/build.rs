@@ -353,6 +353,7 @@ fn read_zig_dependency_hash(ghostty_dir: &Path, dependency_name: &str) -> String
 
 fn isolate_vendored_simdutf_namespace(ghostty_dir: &Path) {
     const LOCAL_NAMESPACE: &str = "libghostty_rs_local_simdutf";
+    const QUALIFIER_PLACEHOLDER: &str = "__LIBGHOSTTY_RS_LOCAL_SIMDUTF_QUALIFIER__";
 
     let files = [
         "pkg/simdutf/vendor/simdutf.h",
@@ -366,13 +367,20 @@ fn isolate_vendored_simdutf_namespace(ghostty_dir: &Path) {
         let mut contents = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         let original = contents.clone();
+        let duplicated_namespace = format!("libghostty_rs_local_{LOCAL_NAMESPACE}");
+        while contents.contains(duplicated_namespace.as_str()) {
+            contents = contents.replace(duplicated_namespace.as_str(), LOCAL_NAMESPACE);
+        }
+        let local_qualifier = format!("{LOCAL_NAMESPACE}::");
         contents = contents
             .replace("namespace simdutf", &format!("namespace {LOCAL_NAMESPACE}"))
-            .replace("simdutf::", &format!("{LOCAL_NAMESPACE}::"))
             .replace(
                 "using namespace simdutf;",
                 &format!("using namespace {LOCAL_NAMESPACE};"),
-            );
+            )
+            .replace(local_qualifier.as_str(), QUALIFIER_PLACEHOLDER)
+            .replace("simdutf::", local_qualifier.as_str())
+            .replace(QUALIFIER_PLACEHOLDER, local_qualifier.as_str());
 
         if contents != original {
             std::fs::write(&path, contents)
